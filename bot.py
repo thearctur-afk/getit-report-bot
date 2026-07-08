@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Telegram-бот для сбора ежедневных активностей партнёрского направления
-Open Service (СПб). Роли, поля и расписание — в config.py.
+Telegram-бот для сбора ежедневных отчётов менеджеров GET IT.
+Роли, поля и расписание — в config.py.
 
 Запуск: python bot.py
 """
@@ -144,8 +144,8 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await state.set_state(Registration.waiting_name)
     await message.answer(
-        "👋 Привет! Это бот ежедневных отчётов партнёрского направления Open Service.\n\n"
-        "Для начала — как вас зовут? Напишите ФИО (например: *Иванов Иван*)."
+        "👋 Привет! Рад видеть в строю. Я собираю ежедневные отчёты.\n"
+        "Напиши свои имя и фамилию, чтобы я закрепил за тобой профиль 👇"
     )
 
 
@@ -188,7 +188,7 @@ async def reg_role(callback: CallbackQuery, state: FSMContext):
         try:
             await bot.send_message(
                 config.ADMIN_ID,
-                f"🆕 Новая регистрация в партнёрском боте:\n"
+                f"🆕 Новая регистрация в боте {config.COMPANY_NAME}:\n"
                 f"*{name}* — {role}\n"
                 f"(@{callback.from_user.username or 'без username'})"
             )
@@ -331,7 +331,7 @@ async def cmd_my(message: Message):
 async def cmd_help(message: Message):
     manager = db.get_manager_by_telegram_id(message.from_user.id)
     text = (
-        "🤖 *Бот ежедневных отчётов — партнёрское направление*\n\n"
+        f"🤖 *Бот ежедневных отчётов — {config.COMPANY_NAME}*\n\n"
         "*Команды менеджера:*\n"
         "/start — регистрация\n"
         "/report — заполнить отчёт за сегодня\n"
@@ -363,7 +363,7 @@ def build_daily_summary(date: str) -> str:
     activities = db.get_activities_for_date(date)
 
     reported = sum(1 for m in managers if db.has_reported(m["manager_id"], date))
-    lines = [f"📊 *Сводка партнёрского направления за {date}*", f"Заполнили: {reported}/{len(managers)}\n"]
+    lines = [f"📊 *Сводка {config.COMPANY_NAME} за {date}*", f"Заполнили: {reported}/{len(managers)}\n"]
 
     if not managers:
         lines.append("Пока нет зарегистрированных менеджеров.")
@@ -391,7 +391,7 @@ def build_monthly_summary(year: int, month: int) -> str:
     managers = db.get_all_managers()
     activities = db.get_activities_for_period(start, end)
 
-    lines = [f"📈 *Итоги партнёрского направления за {start[:7]}*\n"]
+    lines = [f"📈 *Итоги {config.COMPANY_NAME} за {start[:7]}*\n"]
     if not managers:
         lines.append("Пока нет зарегистрированных менеджеров.")
         return "\n".join(lines)
