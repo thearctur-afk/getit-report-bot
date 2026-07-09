@@ -10,7 +10,7 @@
 import json
 import re
 import sqlite3
-from datetime import datetime, date as date_cls
+from datetime import datetime, date as date_cls, timedelta
 from typing import Optional
 
 import config
@@ -180,10 +180,46 @@ def upsert_activity(manager_id: str, date: str, field_key: str,
     conn.close()
 
 
-def set_plan(manager_id: str, field_key: str, plan: float, date: Optional[str] = None) -> None:
-    """Установить план менеджеру по полю. Если дата не передана — берём сегодняшнюю."""
-    date = date or date_cls.today().isoformat()
-    upsert_activity(manager_id, date, field_key, plan=plan)
+def set_plan(manager_id: str, field_key: str, plan: float, date: Optional[str] = None,
+             propagate_to_month_end: bool = True) -> int:
+    """
+    Установить план менеджеру по полю.
+
+    По умолчанию план проставляется не только на указанный день, но и на все
+    оставшиеся дни текущего месяца — так план не "сгорает" на следующий день
+    и не нужно выставлять его заново каждое утро. Возвращает количество дней,
+    на которые план был записан.
+    """
+    start = datetime.strptime(date, "%Y-%m-%d").date() if date else date_cls.today()
+
+    if not propagate_to_month_end:
+        upsert_activity(manager_id, start.isoformat(), field_key, plan=plan)
+        return 1
+
+    if start.month == 12:
+        next_month_first = date_cls(start.year + 1, 1, 1)
+    else:
+        next_month_first = date_cls(start.year, start.month + 1, 1)
+    month_end = next_month_first - timedelta(days=1)
+
+    days_written = 0
+    current = start
+    while current <= month_end:
+        upsert_activity(manager_id, current.isoformat(), field_key, plan=plan)
+        current += timedelta(days=1)
+        days_written += 1
+    return days_written
+
+
+def get_raw_activities(start: str, end: str):
+    """Плоский список всех записей activities за период — для выгрузки в Excel."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT * FROM activities WHERE date BETWEEN ? AND ? ORDER BY date, manager_id, field_key",
+        (start, end),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def get_activities_for_date(date: str) -> dict:
