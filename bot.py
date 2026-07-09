@@ -131,6 +131,12 @@ async def send_to_groups(text: str) -> None:
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     manager = db.get_manager_by_telegram_id(message.from_user.id)
+    if manager and not manager["active"]:
+        await message.answer(
+            "Ваш профиль сейчас отключён администратором.\n"
+            "Если это ошибка — напишите ему напрямую."
+        )
+        return
     if manager:
         await message.answer(
             f"С возвращением, *{manager['name']}*! 👋\n"
@@ -217,6 +223,9 @@ async def cmd_report(message: Message, state: FSMContext):
     manager = db.get_manager_by_telegram_id(message.from_user.id)
     if not manager:
         await message.answer("Вы ещё не зарегистрированы. Нажмите /start, чтобы начать.")
+        return
+    if not manager["active"]:
+        await message.answer("Ваш профиль отключён администратором — отчёт временно недоступен.")
         return
 
     date = today_str()
@@ -347,6 +356,8 @@ async def cmd_help(message: Message):
             "/send_month — отправить месячную сводку в группы\n"
             "/team — список менеджеров\n"
             "/setplan — установить план менеджеру\n"
+            "/remove — убрать менеджера из отчётов и сводок\n"
+            "/activate — вернуть ранее убранного менеджера\n"
             "/export — выгрузить JSON\n"
             "/chatid — узнать ID текущего чата\n"
         )
@@ -460,6 +471,94 @@ async def cmd_team(message: Message):
         status = "✅" if m["active"] else "🚫"
         lines.append(f"{status} *{m['name']}* — {m['role']} (id: `{m['manager_id']}`)")
     await message.answer("\n".join(lines))
+
+
+# --- /remove: деактивировать менеджера (мягкое удаление) -------------------
+@router.message(Command("remove"))
+async def cmd_remove(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    managers = db.get_all_managers(active_only=True)
+    if not managers:
+        await message.answer("Нет активных менеджеров для удаления.")
+        return
+    kb = InlineKeyboardBuilder()
+    for m in managers:
+        kb.button(text=f"{m['name']} ({m['role']})", callback_data=f"rm_mgr:{m['manager_id']}")
+    kb.adjust(1)
+    await message.answer("Кого убрать из отчётов и сводок?", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("rm_mgr:"))
+async def remove_select(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    manager_id = callback.data.split(":", 1)[1]
+    manager = db.get_manager_by_manager_id(manager_id)
+    if not manager:
+        await callback.message.edit_text("Менеджер не найден — возможно, уже удалён.")
+        await callback.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, убрать", callback_data=f"rm_confirm:{manager_id}")
+    kb.button(text="✖️ Отмена", callback_data="rm_cancel")
+    kb.adjust(2)
+    await callback.message.edit_text(
+        f"Убрать *{manager['name']}* ({manager['role']}) из опросника и сводок?\n"
+        f"Его прошлые отчёты сохранятся — их можно будет вернуть командой /activate.",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rm_confirm:"))
+async def remove_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    manager_id = callback.data.split(":", 1)[1]
+    manager = db.get_manager_by_manager_id(manager_id)
+    db.set_manager_active(manager_id, False)
+    name = manager["name"] if manager else manager_id
+    await callback.message.edit_text(f"🚫 *{name}* убран(а) из опросника и сводок.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "rm_cancel")
+async def remove_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("Отменено, никого не трогали.")
+    await callback.answer()
+
+
+# --- /activate: вернуть ранее удалённого менеджера --------------------------
+@router.message(Command("activate"))
+async def cmd_activate(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    all_managers = db.get_all_managers(active_only=False)
+    inactive = [m for m in all_managers if not m["active"]]
+    if not inactive:
+        await message.answer("Нет убранных менеджеров — все активны.")
+        return
+    kb = InlineKeyboardBuilder()
+    for m in inactive:
+        kb.button(text=f"{m['name']} ({m['role']})", callback_data=f"act_mgr:{m['manager_id']}")
+    kb.adjust(1)
+    await message.answer("Кого вернуть в опросник и сводки?", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("act_mgr:"))
+async def activate_manager(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    manager_id = callback.data.split(":", 1)[1]
+    manager = db.get_manager_by_manager_id(manager_id)
+    db.set_manager_active(manager_id, True)
+    name = manager["name"] if manager else manager_id
+    await callback.message.edit_text(f"✅ *{name}* снова в опроснике и сводках.")
+    await callback.answer()
 
 
 @router.message(Command("chatid"))
