@@ -6,8 +6,10 @@ Telegram-бот для сбора ежедневных отчётов менед
 Запуск: python bot.py
 """
 import asyncio
+import io
 import json
 import logging
+import os
 from datetime import datetime, date as date_cls, timedelta
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -24,6 +26,9 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 import config
 import db
@@ -52,6 +57,11 @@ class Survey(StatesGroup):
 
 class SetPlan(StatesGroup):
     waiting_manager = State()
+    waiting_field = State()
+    waiting_value = State()
+
+
+class SetPlanAll(StatesGroup):
     waiting_field = State()
     waiting_value = State()
 
@@ -355,10 +365,13 @@ async def cmd_help(message: Message):
             "/send_summary — отправить сводку в группы сейчас\n"
             "/send_month — отправить месячную сводку в группы\n"
             "/team — список менеджеров\n"
-            "/setplan — установить план менеджеру\n"
+            "/setplan — установить план одному менеджеру\n"
+            "/setplan_all — установить одинаковый план всем менеджерам\n"
             "/remove — убрать менеджера из отчётов и сводок\n"
             "/activate — вернуть ранее убранного менеджера\n"
-            "/export — выгрузить JSON\n"
+            "/export — выгрузить JSON за месяц\n"
+            "/export_excel — выгрузить Excel за месяц (или `/export_excel 2026-07`)\n"
+            "/backup — скачать полную копию базы данных\n"
             "/chatid — узнать ID текущего чата\n"
         )
     if not manager and not is_admin(message.from_user.id):
@@ -598,6 +611,98 @@ async def cmd_export(message: Message):
         await message.answer(f"```json\n{text}\n```")
 
 
+@router.message(Command("export_excel"))
+async def cmd_export_excel(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return
+
+    today = date_cls.today()
+    if command.args:
+        try:
+            year_str, month_str = command.args.strip().split("-")
+            year, month = int(year_str), int(month_str)
+        except (ValueError, AttributeError):
+            await message.answer("Формат: `/export_excel 2026-07` (год-месяц). Без аргумента — текущий месяц.")
+            return
+    else:
+        year, month = today.year, today.month
+
+    start = date_cls(year, month, 1).isoformat()
+    if month == 12:
+        end = date_cls(year, 12, 31).isoformat()
+    else:
+        end = (date_cls(year, month + 1, 1) - timedelta(days=1)).isoformat()
+
+    rows = db.get_raw_activities(start, end)
+    if not rows:
+        await message.answer(f"Нет данных за {start[:7]}.")
+        return
+
+    managers = {m["manager_id"]: m for m in db.get_all_managers(active_only=False)}
+
+    # Сводим плоские записи в таблицу (дата, менеджер) -> {поле: (план, факт)}
+    pivot: dict = {}
+    for r in rows:
+        key = (r["date"], r["manager_id"])
+        pivot.setdefault(key, {})[r["field_key"]] = (r["plan"], r["fact"])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = start[:7]
+
+    header = ["Дата", "Менеджер", "Роль"]
+    for f in config.FIELDS:
+        header.append(f"{f['label']} (факт)")
+        header.append(f"{f['label']} (план)")
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for date, manager_id in sorted(pivot.keys()):
+        m = managers.get(manager_id)
+        name = m["name"] if m else manager_id
+        role = m["role"] if m else ""
+        row = [date, name, role]
+        field_data = pivot[(date, manager_id)]
+        for f in config.FIELDS:
+            plan, fact = field_data.get(f["key"], (0, 0))
+            row.append(fact)
+            row.append(plan)
+        ws.append(row)
+
+    widths = [12, 24, 22] + [18] * (2 * len(config.FIELDS))
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"activities_{start[:7]}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=f"📊 Активности за {start[:7]} — одна строка на менеджера в день, готово для сводной таблицы в Excel.",
+    )
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not os.path.exists(config.DB_PATH):
+        await message.answer("Файл базы данных не найден.")
+        return
+    with open(config.DB_PATH, "rb") as fh:
+        data = fh.read()
+    filename = f"backup_{date_cls.today().isoformat()}.db"
+    await message.answer_document(
+        BufferedInputFile(data, filename=filename),
+        caption=(
+            "📦 Полный бэкап базы данных (файл SQLite).\n"
+            "Храните в надёжном месте — из него можно восстановить всех менеджеров и все отчёты."
+        ),
+    )
+
+
 # --- /setplan: FSM админа --------------------------------------------------
 @router.message(Command("setplan"))
 async def cmd_setplan(message: Message, state: FSMContext):
@@ -655,11 +760,69 @@ async def setplan_value(message: Message, state: FSMContext):
     field = config.field_by_key(field_key)
     date = today_str()
 
-    db.set_plan(manager_id, field_key, value, date=date)
+    days = db.set_plan(manager_id, field_key, value, date=date)
     manager = db.get_manager_by_manager_id(manager_id)
     await state.clear()
     await message.answer(
-        f"✅ План установлен: *{manager['name']}* — {field['label']}: {fmt_value(value, field['type'])} {field['unit']}"
+        f"✅ План установлен: *{manager['name']}* — {field['label']}: {fmt_value(value, field['type'])} {field['unit']}\n"
+        f"Проставлен на {days} дн. — до конца текущего месяца. В начале следующего месяца план нужно поставить снова."
+    )
+
+
+# --- /setplan_all: тот же план сразу всем менеджерам ------------------------
+@router.message(Command("setplan_all"))
+async def cmd_setplan_all(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    managers = db.get_all_managers()
+    if not managers:
+        await message.answer("Пока нет зарегистрированных менеджеров.")
+        return
+    kb = InlineKeyboardBuilder()
+    for f in config.FIELDS:
+        kb.button(text=f"{f['emoji']} {f['label']}", callback_data=f"spa_field:{f['key']}")
+    kb.adjust(1)
+    await state.set_state(SetPlanAll.waiting_field)
+    await message.answer(
+        f"Ставим одинаковый план на *всех* активных менеджеров ({len(managers)} чел.).\nПо какому полю?",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(SetPlanAll.waiting_field, F.data.startswith("spa_field:"))
+async def setplan_all_field(callback: CallbackQuery, state: FSMContext):
+    field_key = callback.data.split(":", 1)[1]
+    field = config.field_by_key(field_key)
+    await state.update_data(field_key=field_key)
+    await state.set_state(SetPlanAll.waiting_value)
+    await callback.message.edit_text(f"Введите значение плана для «{field['label']}» ({field['unit']}) на каждого:")
+    await callback.answer()
+
+
+@router.message(SetPlanAll.waiting_value)
+async def setplan_all_value(message: Message, state: FSMContext):
+    text = message.text.strip().replace(" ", "").replace(",", ".")
+    try:
+        value = float(text)
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно положительное число. Попробуйте ещё раз:")
+        return
+
+    data = await state.get_data()
+    field_key = data["field_key"]
+    field = config.field_by_key(field_key)
+    date = today_str()
+
+    managers = db.get_all_managers()
+    days = 0
+    for m in managers:
+        days = db.set_plan(m["manager_id"], field_key, value, date=date)
+    await state.clear()
+    await message.answer(
+        f"✅ План «{field['label']}»: {fmt_value(value, field['type'])} {field['unit']} "
+        f"установлен для всех {len(managers)} менеджеров, на {days} дн. до конца месяца."
     )
 
 
