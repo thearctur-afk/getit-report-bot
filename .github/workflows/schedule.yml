@@ -1,1 +1,37 @@
+name: Ежедневные напоминание и сводка
 
+# Расписание задаётся в UTC. Россия не переходит на летнее время, поэтому
+# МСК = UTC+3 весь год: 18:30 МСК = 15:30 UTC, 19:15 МСК = 16:15 UTC.
+# GitHub Actions может присылать сигнал с опозданием на несколько минут
+# при высокой нагрузке на их стороне — для наших целей это не критично.
+on:
+  schedule:
+    - cron: "30 15 * * 1-5"   # 18:30 МСК, пн-пт — напоминание менеджерам
+    - cron: "15 16 * * 1-5"   # 19:15 МСК, пн-пт — сводка админу и в группы
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Что запустить вручную"
+        required: true
+        default: "summary"
+        type: choice
+        options:
+          - reminder
+          - summary
+
+jobs:
+  trigger-reminder:
+    if: github.event.schedule == '30 15 * * 1-5' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'reminder')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Дёрнуть /trigger/reminder
+        run: |
+          curl -sS -X POST "https://${{ secrets.PA_DOMAIN }}/trigger/reminder/${{ secrets.WEBHOOK_SECRET }}"
+
+  trigger-summary:
+    if: github.event.schedule == '15 16 * * 1-5' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'summary')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Дёрнуть /trigger/summary
+        run: |
+          curl -sS -X POST "https://${{ secrets.PA_DOMAIN }}/trigger/summary/${{ secrets.WEBHOOK_SECRET }}"
